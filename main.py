@@ -7,6 +7,9 @@ import traceback
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
 from flask import Flask, request, jsonify
+from pdf2image import convert_from_bytes
+from PIL import Image
+import pytesseract
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -23,7 +26,6 @@ DB_NAME = "postgres"
 DB_USER = "postgres.iuqtgadqkslwohenylab"
 DB_PASSWORD = "Sreehari@1234#"  # Replace with your actual password
 
-
 def get_db_connection():
     conn = psycopg2.connect(
         host=DB_HOST,
@@ -34,14 +36,27 @@ def get_db_connection():
     )
     return conn
 
-
 def extract_text_from_pdf(file):
-    reader = PyPDF2.PdfReader(file)
-    text_content = ""
-    for page in reader.pages:
-        text_content += page.extract_text()
-    return text_content
+    try:
+        reader = PyPDF2.PdfReader(file)
+        text_content = ""
+        for page in reader.pages:
+            text_content += page.extract_text()
+        return text_content
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return ""
 
+def extract_text_with_ocr(file):
+    try:
+        images = convert_from_bytes(file.read())  # Convert PDF pages to images
+        text_content = ""
+        for image in images:
+            text_content += pytesseract.image_to_string(image)
+        return text_content
+    except Exception as e:
+        print(f"Error extracting text with OCR: {e}")
+        return ""
 
 def generate_embeddings(text):
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
@@ -49,8 +64,6 @@ def generate_embeddings(text):
         outputs = model(**inputs)
     embeddings = outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
     return embeddings  # This should be a flat list
-
-
 
 def insert_embedding(staff_id, file_name, content, embedding):
     conn = get_db_connection()
@@ -70,8 +83,6 @@ def insert_embedding(staff_id, file_name, content, embedding):
     finally:
         cursor.close()
         conn.close()
-
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -93,6 +104,11 @@ def upload_file():
         # Extract text from the uploaded PDF file
         file_content = extract_text_from_pdf(file)
 
+        # If no text was extracted, attempt OCR
+        if not file_content.strip():
+            file.seek(0)  # Reset file pointer for OCR
+            file_content = extract_text_with_ocr(file)
+
         if not file_content.strip():
             return jsonify({"error": "Could not extract text from the file"}), 400
 
@@ -113,8 +129,5 @@ def upload_file():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-    print(len(embeddings))
-
-
 if __name__ == "__main__":
-    app.run(debug=True,host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)
