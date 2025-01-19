@@ -2,6 +2,7 @@ import os
 import PyPDF2
 import torch
 import psycopg2
+import json
 import traceback
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
@@ -9,11 +10,6 @@ from flask import Flask, request, jsonify
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
-from concurrent.futures import ThreadPoolExecutor
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -24,13 +20,11 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
 
 # Database configuration
-DB_HOST = os.getenv("DB_HOST", "aws-0-ap-south-1.pooler.supabase.com")
-DB_PORT = os.getenv("DB_PORT", "6543")
-DB_NAME = os.getenv("DB_NAME", "postgres")
-DB_USER = os.getenv("DB_USER", "postgres.iuqtgadqkslwohenylab")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Sreehari@1234#")  # Replace with your actual password
-
-
+DB_HOST = "aws-0-ap-south-1.pooler.supabase.com"
+DB_PORT = "6543"
+DB_NAME = "postgres"
+DB_USER = "postgres.iuqtgadqkslwohenylab"
+DB_PASSWORD = "Sreehari@1234#"  # Replace with your actual password
 
 def get_db_connection():
     conn = psycopg2.connect(
@@ -45,23 +39,12 @@ def get_db_connection():
 def extract_text_from_pdf(file):
     try:
         reader = PyPDF2.PdfReader(file)
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")  # Attempt to decrypt if encrypted
-            except Exception as decrypt_error:
-                print(f"Failed to decrypt PDF: {decrypt_error}")
-                return ""
-
         text_content = ""
-        for page_number, page in enumerate(reader.pages):
-            try:
-                text_content += page.extract_text() or ""  # Attempt text extraction
-            except Exception as page_error:
-                print(f"Error on page {page_number}: {page_error}")
+        for page in reader.pages:
+            text_content += page.extract_text()
         return text_content
-
     except Exception as e:
-        print(f"Error reading PDF: {e}")
+        print(f"Error extracting text from PDF: {e}")
         return ""
 
 def extract_text_with_ocr(file):
@@ -82,30 +65,24 @@ def generate_embeddings(text):
     embeddings = outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
     return embeddings  # This should be a flat list
 
-def generate_embeddings_parallel(text_chunks):
-    with ThreadPoolExecutor() as executor:
-        embeddings = list(executor.map(generate_embeddings, text_chunks))
-    return torch.mean(torch.tensor(embeddings), dim=0).tolist()
-
-def insert_image_embedding(doc_id, page_number, image_number, embedding):
+def insert_embedding(staff_id, file_name, content, embedding):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO embeddings_images (doc_id, page_number, image_number, embedding, created_at)
+            INSERT INTO embeddings (staff_id, file_name, content, embedding, created_at)
             VALUES (%s, %s, %s, %s::vector, %s)
             """,
-            (doc_id, page_number, image_number, embedding, datetime.now())
+            (staff_id, file_name, content, embedding, datetime.now())
         )
         conn.commit()
     except psycopg2.errors.DataError as e:
         print(f"DataError: {e}")
-        conn.rollback()
+        conn.rollback()  # Rollback the transaction on error
     finally:
         cursor.close()
         conn.close()
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -116,9 +93,10 @@ def upload_file():
         if not file or not staff_id:
             return jsonify({"error": "File and staff ID are required"}), 400
 
+        # Validate staff_id as numeric (optional)
         if not staff_id.isdigit():
             return jsonify({"error": "Invalid staff ID. Must be numeric."}), 400
-        staff_id = int(staff_id)
+        staff_id = int(staff_id)  # Convert to integer if the database expects it
 
         if file.filename == "":
             return jsonify({"error": "Invalid file name"}), 400
@@ -128,44 +106,17 @@ def upload_file():
 
         # If no text was extracted, attempt OCR
         if not file_content.strip():
-            file.seek(0)
+            file.seek(0)  # Reset file pointer for OCR
             file_content = extract_text_with_ocr(file)
 
         if not file_content.strip():
             return jsonify({"error": "Could not extract text from the file"}), 400
 
-        # Split text into smaller chunks for parallel embedding generation
-        text_chunks = [file_content[i:i + 500] for i in range(0, len(file_content), 500)]
-        text_embedding = generate_embeddings_parallel(text_chunks)
+        # Generate embeddings for the extracted text
+        embedding = generate_embeddings(file_content)
 
-        # Insert the text embedding into the database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO embeddings (staff_id, file_name, content, created_at)
-            VALUES (%s, %s, %s, %s) RETURNING id
-            """,
-            (staff_id, file.filename, file_content, datetime.now())
-        )
-        doc_id = cursor.fetchone()[0]
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-
-        # Extract image embeddings
-        file.seek(0)  # Reset file pointer
-        images = convert_from_bytes(file.read())
-        for page_number, image in enumerate(images):
-            image_number = 0  # Reset image number for each page
-
-            # Option 1: Use entire image for embedding
-            image_embedding = generate_embeddings(pytesseract.image_to_string(image))
-            insert_image_embedding(doc_id, page_number, image_number, image_embedding)
-
-            # Increment the image number for consistency
-            image_number += 1
+        # Insert the embedding into the database
+        insert_embedding(staff_id, file.filename, file_content, embedding)
 
         return jsonify({
             "message": "File uploaded and processed successfully",
@@ -179,7 +130,7 @@ def upload_file():
         return jsonify({"error": str(e)}), 500
 
 
-# Search Endpoint
+
 @app.route('/search', methods=['POST'])
 def search():
     try:
@@ -194,15 +145,19 @@ def search():
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # Query the embeddings table for cosine similarity
         cursor.execute(
             """
             SELECT content, file_name, staff_id, created_at, embedding <-> %s::vector AS similarity
             FROM embeddings
-            ORDER BY similarity
+            WHERE embedding IS NOT NULL
+            ORDER BY similarity ASC
             LIMIT 5
             """,
             (query_embedding,)
         )
+
         results = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -216,7 +171,7 @@ def search():
                 "created_at": result[3].strftime('%Y-%m-%d %H:%M:%S'),
                 "similarity": result[4],
             }
-            for result in results
+            for result in results if result[4] is not None
         ]
 
         return jsonify({"results": formatted_results}), 200
@@ -224,9 +179,6 @@ def search():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-
-
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=5000)
