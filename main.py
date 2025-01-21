@@ -10,6 +10,8 @@ from flask import Flask, request, jsonify
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
+import csv
+
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -128,6 +130,68 @@ def upload_file():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+@app.route('/upload_csv', methods=['POST'])
+def upload_csv():
+    try:
+        file = request.files.get('file')
+        staff_id = request.form.get('staff_id')
+
+        if not file or not staff_id:
+            return jsonify({"error": "File and staff ID are required"}), 400
+
+        # Validate staff_id as numeric (optional)
+        if not staff_id.isdigit():
+            return jsonify({"error": "Invalid staff ID. Must be numeric."}), 400
+        staff_id = int(staff_id)  # Convert to integer if the database expects it
+
+        # Read the CSV file
+        csv_data = file.stream.read().decode('utf-8')  # Decode the file content
+        rows = csv_data.splitlines()
+        reader = csv.reader(rows)
+
+        # Validate headers
+        headers = next(reader, None)
+        if 'Content' not in headers or 'Embedding' not in headers:
+            return jsonify({"error": "CSV must include 'Content' and 'Embedding' columns"}), 400
+
+        # Get indexes of the relevant columns
+        content_idx = headers.index('Content')
+        embedding_idx = headers.index('Embedding')
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Process rows and insert into database
+        for row in reader:
+            content = row[content_idx]
+            embedding = list(map(float, row[embedding_idx].split(',')))  # Convert embedding to a float vector
+
+            cursor.execute(
+                """
+                INSERT INTO embeddings (staff_id, file_name, content, embedding, created_at)
+                VALUES (%s, %s, %s, %s::vector, %s)
+                """,
+                (staff_id, file.filename, content, embedding, datetime.now())
+            )
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+            "message": "CSV file uploaded and processed successfully",
+            "file_name": file.filename,
+            "staff_id": str(staff_id),
+            "created_at": str(datetime.now()),
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
 
 
 
