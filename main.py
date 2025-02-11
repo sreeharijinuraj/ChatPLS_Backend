@@ -1,152 +1,77 @@
 import os
 import PyPDF2
 import torch
-import psycopg2
+import chromadb
 import json
 import traceback
+import csv
+import pandas as pd
 from datetime import datetime
-from transformers import AutoTokenizer, AutoModel
 from flask import Flask, request, jsonify
+from transformers import AutoTokenizer, AutoModel
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
-import csv
-
 
 # Initialize Flask app
 app = Flask(__name__)
 
 # Load the model
-model_name = 'sentence-transformers/all-MiniLM-L6-v2'  # Change to a suitable model
+model_name = 'sentence-transformers/all-MiniLM-L6-v2'
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
 
-# Database configuration
-DB_HOST = "aws-0-ap-south-1.pooler.supabase.com"
-DB_PORT = "6543"
-DB_NAME = "postgres"
-DB_USER = "postgres.iuqtgadqkslwohenylab"
-DB_PASSWORD = "Sreehari@1234#"  # Replace with your actual password
+# ChromaDB setup
+CHROMA_DB_FOLDER = "chroma_db"
+chroma_client = chromadb.PersistentClient(path=CHROMA_DB_FOLDER)
+collection = chroma_client.get_or_create_collection(name="product_embeddings")
 
-def get_db_connection():
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
-    return conn
+# Ensure ChromaDB folder exists
+if not os.path.exists(CHROMA_DB_FOLDER):
+    os.makedirs(CHROMA_DB_FOLDER)
+
+print("ChromaDB collections:", chroma_client.list_collections())
+
 
 def extract_text_from_pdf(file):
+    """Extract text from a PDF file."""
     try:
         reader = PyPDF2.PdfReader(file)
-        text_content = ""
-        for page in reader.pages:
-            text_content += page.extract_text()
-        return text_content
+        return "".join(page.extract_text() for page in reader.pages if page.extract_text())
     except Exception as e:
         print(f"Error extracting text from PDF: {e}")
         return ""
 
+
 def extract_text_with_ocr(file):
+    """Extract text using OCR from an image-based PDF."""
     try:
-        images = convert_from_bytes(file.read())  # Convert PDF pages to images
-        text_content = ""
-        for image in images:
-            text_content += pytesseract.image_to_string(image)
-        return text_content
+        images = convert_from_bytes(file.read())
+        return "".join(pytesseract.image_to_string(image) for image in images)
     except Exception as e:
         print(f"Error extracting text with OCR: {e}")
         return ""
 
+
 def generate_embeddings(text):
+    """Generate embeddings for the given text."""
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
     with torch.no_grad():
         outputs = model(**inputs)
-    embeddings = outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
-    return embeddings  # This should be a flat list
+    return outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
 
-def insert_embedding(staff_id, file_name, content, embedding):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            INSERT INTO embeddings (staff_id, file_name, content, embedding, created_at)
-            VALUES (%s, %s, %s, %s::vector, %s)
-            """,
-            (staff_id, file_name, content, embedding, datetime.now())
-        )
-        conn.commit()
-    except psycopg2.errors.DataError as e:
-        print(f"DataError: {e}")
-        conn.rollback()  # Rollback the transaction on error
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    try:
-        file = request.files.get('file')
-        staff_id = request.form.get('staff_id')
-
-        if not file or not staff_id:
-            return jsonify({"error": "File and staff ID are required"}), 400
-
-        # Validate staff_id as numeric (optional)
-        if not staff_id.isdigit():
-            return jsonify({"error": "Invalid staff ID. Must be numeric."}), 400
-        staff_id = int(staff_id)  # Convert to integer if the database expects it
-
-        if file.filename == "":
-            return jsonify({"error": "Invalid file name"}), 400
-
-        # Extract text from the uploaded PDF file
-        file_content = extract_text_from_pdf(file)
-
-        # If no text was extracted, attempt OCR
-        if not file_content.strip():
-            file.seek(0)  # Reset file pointer for OCR
-            file_content = extract_text_with_ocr(file)
-
-        if not file_content.strip():
-            return jsonify({"error": "Could not extract text from the file"}), 400
-
-        # Generate embeddings for the extracted text
-        embedding = generate_embeddings(file_content)
-
-        # Insert the embedding into the database
-        insert_embedding(staff_id, file.filename, file_content, embedding)
-
-        return jsonify({
-            "message": "File uploaded and processed successfully",
-            "file_name": file.filename,
-            "staff_id": str(staff_id),
-            "created_at": str(datetime.now()),
-        }), 200
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/upload_csv', methods=['POST'])
 def upload_csv():
+    """Upload CSV file and store embeddings in ChromaDB."""
     try:
         file = request.files.get('file')
-        staff_id = request.form.get('staff_id')
 
-        if not file or not staff_id:
-            return jsonify({"error": "File and staff ID are required"}), 400
+        if not file:
+            return jsonify({"error": "CSV file is required"}), 400
 
-        # Validate staff_id as numeric (optional)
-        if not staff_id.isdigit():
-            return jsonify({"error": "Invalid staff ID. Must be numeric."}), 400
-        staff_id = int(staff_id)  # Convert to integer if the database expects it
-
-        # Read the CSV file
-        csv_data = file.stream.read().decode('utf-8')  # Decode the file content
+        # Read CSV data
+        csv_data = file.stream.read().decode('utf-8')
         rows = csv_data.splitlines()
         reader = csv.reader(rows)
 
@@ -155,35 +80,42 @@ def upload_csv():
         if 'Content' not in headers or 'Embedding' not in headers:
             return jsonify({"error": "CSV must include 'Content' and 'Embedding' columns"}), 400
 
-        # Get indexes of the relevant columns
         content_idx = headers.index('Content')
         embedding_idx = headers.index('Embedding')
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Get existing stored IDs in ChromaDB
+        existing_ids = set(collection.get()["ids"])
+        print(f"Existing IDs in ChromaDB: {existing_ids}")  # Debugging
 
-        # Process rows and insert into database
+        new_entries = []
+        new_metadata = []
+
         for row in reader:
             content = row[content_idx]
-            embedding = list(map(float, row[embedding_idx].split(',')))  # Convert embedding to a float vector
+            embedding = list(map(float, row[embedding_idx].split(',')))  # Convert to float vector
+            unique_id = str(hash(content))  # Unique ID for each row
 
-            cursor.execute(
-                """
-                INSERT INTO embeddings (staff_id, file_name, content, embedding, created_at)
-                VALUES (%s, %s, %s, %s::vector, %s)
-                """,
-                (staff_id, file.filename, content, embedding, datetime.now())
+            # Skip if ID already exists
+            if unique_id in existing_ids:
+                print(f"Skipping duplicate entry: {content}")
+                continue
+
+            new_entries.append(embedding)
+            new_metadata.append({"file_name": file.filename, "content": content})
+
+        # Add only new embeddings to ChromaDB
+        if new_entries:
+            collection.add(
+                ids=[str(hash(meta["content"])) for meta in new_metadata],
+                embeddings=new_entries,
+                metadatas=new_metadata
             )
 
-        conn.commit()
-        cursor.close()
-        conn.close()
-
         return jsonify({
-            "message": "CSV file uploaded and processed successfully",
+            "message": "CSV file uploaded and stored in ChromaDB successfully",
             "file_name": file.filename,
-            "staff_id": str(staff_id),
-            "created_at": str(datetime.now()),
+            'created_at': datetime.now().isoformat(),
+            'staff_id': request.form.get('staff_id', 'Unknown')
         }), 200
 
     except Exception as e:
@@ -192,57 +124,86 @@ def upload_csv():
 
 
 
+@app.route('/check_file_exists', methods=['GET'])
+def check_file_exists():
+    """Check if a file already exists in ChromaDB."""
+    file_name = request.args.get('file_name')
+    if not file_name:
+        return jsonify({"error": "Missing file_name parameter"}), 400
+
+    results = collection.get(where={"file_name": file_name})
+    return jsonify({"exists": bool(results["ids"])}), (200 if results["ids"] else 404)
+
+
+@app.route('/get_uploaded_files', methods=['GET'])
+def get_uploaded_files():
+    """Retrieve uploaded files from ChromaDB."""
+    try:
+        results = collection.get()
+        print("Raw ChromaDB Response:", results)  # Debugging
+
+        uploaded_files = {}
+        for i in range(len(results["ids"])):
+            file_name = results["metadatas"][i].get("file_name", "Unknown")
+
+            # Avoid duplicates in the response
+            if file_name not in uploaded_files:
+                uploaded_files[file_name] = {
+                    "name": file_name,
+                    "dateTime": results["metadatas"][i].get("created_at", "Unknown"),
+                    "type": "csv",
+                    "staffId": results["metadatas"][i].get("staff_id", "Unknown"),
+                }
+
+        print("Filtered API Response:", uploaded_files.values())  # Debugging
+        return jsonify(list(uploaded_files.values())), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/delete_file', methods=['DELETE'])
+def delete_file():
+    data = request.json
+    file_name = data.get("file_name")
+
+    if not file_name:
+        return jsonify({"error": "File name is required"}), 400
+
+    try:
+        # Retrieve IDs associated with the file name
+        results = collection.get(where={"file_name": file_name})
+
+        if not results["ids"]:
+            return jsonify({"error": "File not found in ChromaDB"}), 404
+
+        # Delete the file from ChromaDB using retrieved IDs
+        collection.delete(ids=results["ids"])
+
+        return jsonify({"message": "File deleted successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 
 @app.route('/search', methods=['POST'])
 def search():
+    """Search for similar embeddings in ChromaDB."""
     try:
         data = request.json
         query = data.get('query')
-
         if not query:
             return jsonify({"error": "Query is required"}), 400
 
-        # Generate embedding for the query
         query_embedding = generate_embeddings(query)
+        results = collection.query(query_embeddings=[query_embedding], n_results=5)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Query the embeddings table for cosine similarity
-        cursor.execute(
-            """
-            SELECT content, file_name, staff_id, created_at, embedding <-> %s::vector AS similarity
-            FROM embeddings
-            WHERE embedding IS NOT NULL
-            ORDER BY similarity ASC
-            LIMIT 5
-            """,
-            (query_embedding,)
-        )
-
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
-
-        # Format the response
-        formatted_results = [
-            {
-                "content": result[0],
-                "file_name": result[1],
-                "staff_id": result[2],
-                "created_at": result[3].strftime('%Y-%m-%d %H:%M:%S'),
-                "similarity": result[4],
-            }
-            for result in results if result[4] is not None
-        ]
+        formatted_results = [{"content": result["content"], "similarity": similarity}
+                             for result, similarity in zip(results["metadatas"][0], results["distances"][0])]
 
         return jsonify({"results": formatted_results}), 200
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=5000)
