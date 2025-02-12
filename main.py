@@ -12,9 +12,15 @@ from transformers import AutoTokenizer, AutoModel
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
+import openai
+import random
 
 # Initialize Flask app
 app = Flask(__name__)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
 
 # Load the model
 model_name = 'sentence-transformers/all-MiniLM-L6-v2'
@@ -25,6 +31,18 @@ model = AutoModel.from_pretrained(model_name)
 CHROMA_DB_FOLDER = "chroma_db"
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_FOLDER)
 collection = chroma_client.get_or_create_collection(name="product_embeddings")
+
+# Welcome messages
+welcome_messages = [
+    "Certainly! Here are the results from Our ChatBot:",
+    "You got it! Here's what I found:",
+    "Sure thing! Check out these results:",
+    "Here are the products you're looking for:",
+    "I found these matches for you:",
+    "Take a look at these options:",
+    "Here’s what I discovered:",
+    "These are the products that match your query:",
+]
 
 # Ensure ChromaDB folder exists
 if not os.path.exists(CHROMA_DB_FOLDER):
@@ -184,22 +202,78 @@ def delete_file():
 
 
 
+def similarity_search(query_text: str):
+    """Perform similarity search and generate a response using OpenAI's GPT model."""
+    try:
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=8,
+            include=["documents", "metadatas"]
+        )
+
+        print("ChromaDB Query Results:", results)  # Debugging
+
+        if not results['metadatas'] or not results['metadatas'][0]:
+            return "No relevant results found."
+
+        # Extract product information correctly
+        documents = [meta.get("content", "No product details available") for meta in results['metadatas'][0]]
+
+        # Check if we extracted any valid content
+        if all(doc == "No product details available" for doc in documents):
+            print("No valid content found in query results")
+            return "No relevant results found."
+
+        context = "\n".join(documents)
+        print("Context for GPT:", context)  # Debugging
+
+        # GPT prompt
+        prompt = f"""
+        Answer the user's question using the following product information:
+
+        Question: {query_text}
+
+        Product Information:
+        {context}
+
+        Answer:
+        """
+
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+
+        formatted_response = response.choices[0].message.content.strip()
+        return formatted_response
+
+    except Exception as e:
+        print(f"Error during query: {e}")
+        return "An error occurred while processing your request."
+
+
+
+
 @app.route('/search', methods=['POST'])
 def search():
-    """Search for similar embeddings in ChromaDB."""
+    """Search for similar embeddings in ChromaDB and integrate GPT-4."""
     try:
         data = request.json
         query = data.get('query')
         if not query:
             return jsonify({"error": "Query is required"}), 400
 
-        query_embedding = generate_embeddings(query)
-        results = collection.query(query_embeddings=[query_embedding], n_results=5)
+        # Perform similarity search with GPT-4 integration
+        gpt4_response = similarity_search(query)
 
-        formatted_results = [{"content": result["content"], "similarity": similarity}
-                             for result, similarity in zip(results["metadatas"][0], results["distances"][0])]
-
-        return jsonify({"results": formatted_results}), 200
+        return jsonify({"response": gpt4_response}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
