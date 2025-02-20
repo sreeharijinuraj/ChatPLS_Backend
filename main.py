@@ -10,10 +10,18 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from transformers import AutoTokenizer, AutoModel
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ExifTags
 import pytesseract
 import openai
 import random
+import torchvision
+import io
+from torchvision import models, transforms
+import torch.nn as nn
+import numpy as np
+import base64
+import open_clip
+
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -31,10 +39,13 @@ model = AutoModel.from_pretrained(model_name)
 CHROMA_DB_FOLDER = "chroma_db"
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_FOLDER)
 collection = chroma_client.get_or_create_collection(name="product_embeddings")
+image_collection = chroma_client.get_or_create_collection(name="image_embeddings", metadata={"dimension": 2048})
+
+
 
 # Welcome messages
 welcome_messages = [
-    "Certainly! Here are the results from Our ChatBot:",
+    "Certainly! Here are the results from Our ChatPLS:",
     "You got it! Here's what I found:",
     "Sure thing! Check out these results:",
     "Here are the products you're looking for:",
@@ -77,6 +88,73 @@ def generate_embeddings(text):
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
+
+
+
+def extract_image_embeddings(image):
+    """Extract image embeddings using ResNet-50."""
+
+
+    model = models.resnet50(pretrained=True)
+    model = torch.nn.Sequential(*list(model.children())[:-1])  # Remove final classification layer
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    img_tensor = transform(image).unsqueeze(0)  # Add batch dimension
+
+    with torch.no_grad():
+        embedding = model(img_tensor).squeeze().numpy()  # Get 2048-dimensional feature vector
+
+    return embedding.tolist()
+
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    """Handle image upload, extract EXIF metadata, compute embeddings, and store in ChromaDB."""
+    try:
+        file = request.files.get('image') or request.files.get('file')
+
+
+        if not file:
+            return jsonify({"error": "Image file is required"}), 400
+
+        # Read image and extract EXIF metadata
+        image = Image.open(file)
+        exif_data = image._getexif() if image._getexif() else {}
+        exif_metadata = {ExifTags.TAGS.get(tag, tag): value for tag, value in exif_data.items()}
+
+        # Generate image embeddings (2048-dim vector)
+        image_embedding = extract_image_embeddings(image)
+        if not image_embedding:
+            return jsonify({"error": "Failed to extract image embeddings"}), 500
+
+        # Store image embedding in the image collection
+        unique_id = str(hash(file.filename))  # Unique ID for image
+        image_collection.add(
+            ids=[unique_id],
+            embeddings=[image_embedding],
+            metadatas=[{
+                "file_name": file.filename,
+                "exif_metadata": json.dumps(exif_metadata)
+            }]
+        )
+
+        return jsonify({
+            "message": "Image uploaded successfully",
+            "file_name": file.filename,
+            "created_at": datetime.now().isoformat()
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 
 
 @app.route('/upload_csv', methods=['POST'])
@@ -200,6 +278,56 @@ def delete_file():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/get_uploaded_images', methods=['GET'])
+def get_uploaded_images():
+    """Retrieve uploaded images from ChromaDB."""
+    try:
+        results = image_collection.get()
+        print("Raw Image ChromaDB Response:", results)  # Debugging
+
+        uploaded_images = []
+        for i in range(len(results["ids"])):
+            file_name = results["metadatas"][i].get("file_name", "Unknown")
+            exif_metadata = results["metadatas"][i].get("exif_metadata", "{}")
+
+            uploaded_images.append({
+                "name": file_name,
+                "dateTime": results["metadatas"][i].get("created_at", "Unknown"),
+                "type": "image",
+                "exif_metadata": json.loads(exif_metadata)
+            })
+
+        print("Filtered API Response:", uploaded_images)  # Debugging
+        return jsonify(uploaded_images), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+print(image_collection.count())  # Should return number of stored images
+
+@app.route('/delete_image_file', methods=['DELETE'])
+def delete_image_file():
+    """Delete an image file from ChromaDB."""
+    data = request.json
+    file_name = data.get("file_name")
+
+    if not file_name:
+        return jsonify({"error": "File name is required"}), 400
+
+    try:
+        # Retrieve IDs associated with the file name
+        results = image_collection.get(where={"file_name": file_name})
+
+        if not results["ids"]:
+            return jsonify({"error": "Image file not found in ChromaDB"}), 404
+
+        # Delete the image file from ChromaDB using retrieved IDs
+        image_collection.delete(ids=results["ids"])
+
+        return jsonify({"message": "Image file deleted successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 
 def similarity_search(query_text: str):
@@ -257,6 +385,50 @@ def similarity_search(query_text: str):
     except Exception as e:
         print(f"Error during query: {e}")
         return "An error occurred while processing your request."
+
+
+@app.route('/search_image', methods=['POST'])
+def search_image():
+    """Search for similar images using an image query (ResNet-50 embeddings)."""
+    try:
+        file = request.files.get('image') or request.files.get('file')
+
+        if not file:
+            return jsonify({"error": "Image file is required"}), 400
+
+        # Load the query image
+        query_image = Image.open(file)
+
+        # Extract embedding for the query image
+        query_embedding = extract_image_embeddings(query_image)
+
+        if not query_embedding:
+            return jsonify({"error": "Failed to extract image embedding"}), 500
+
+        # Perform similarity search using the extracted embedding
+        results = image_collection.query(
+            query_embeddings=[query_embedding],  # Use embedding instead of text
+            n_results=10,
+            include=["metadatas"]
+        )
+
+        if not results['metadatas'] or not results['metadatas'][0]:
+            return jsonify({"message": "No similar images found"}), 200
+
+        # Process the matched results
+        matched_images = [
+            {
+                "file_name": meta.get("file_name", "Unknown"),
+                "exif_metadata": json.loads(meta.get("exif_metadata", "{}")),
+            }
+            for meta in results['metadatas'][0]
+        ]
+
+        return jsonify({"matches": matched_images}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 
