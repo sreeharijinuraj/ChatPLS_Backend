@@ -21,10 +21,12 @@ import torch.nn as nn
 import numpy as np
 import base64
 import open_clip
+import requests
 
 
 # Initialize Flask app
 app = Flask(__name__)
+web_search_enabled = False
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
@@ -40,6 +42,7 @@ CHROMA_DB_FOLDER = "chroma_db"
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_FOLDER)
 collection = chroma_client.get_or_create_collection(name="product_embeddings")
 image_collection = chroma_client.get_or_create_collection(name="image_embeddings", metadata={"dimension": 2048})
+print(f"Total image embeddings: {len(image_collection.get()['ids'])}")
 
 
 
@@ -109,6 +112,7 @@ def extract_image_embeddings(image):
 
     with torch.no_grad():
         embedding = model(img_tensor).squeeze().numpy()  # Get 2048-dimensional feature vector
+        print(f"Embedding length: {len(embedding)}, First 5 values: {embedding[:5]}")
 
     return embedding.tolist()
 
@@ -297,7 +301,7 @@ def get_uploaded_images():
                 "exif_metadata": json.loads(exif_metadata)
             })
 
-        print("Filtered API Response:", uploaded_images)  # Debugging
+        #print("Filtered API Response:", uploaded_images)  # Debugging
         return jsonify(uploaded_images), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -408,9 +412,12 @@ def search_image():
         # Perform similarity search using the extracted embedding
         results = image_collection.query(
             query_embeddings=[query_embedding],  # Use embedding instead of text
-            n_results=10,
+            n_results=2,
             include=["metadatas"]
+
         )
+        print("Query Results:", json.dumps(results, indent=4))
+
 
         if not results['metadatas'] or not results['metadatas'][0]:
             return jsonify({"message": "No similar images found"}), 200
@@ -449,6 +456,118 @@ def search():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/toggle_web_search', methods=['POST'])
+def toggle_web_search():
+    global web_search_enabled
+    enabled = request.form.get('enabled') == 'true'
+    web_search_enabled = enabled
+    return jsonify({"status": "Web search " + ("enabled" if enabled else "disabled")})
+
+def perform_duckduckgo_search(query):
+    try:
+        # URL encode the query
+        encoded_query = requests.utils.quote(query)
+        url = f"https://api.duckduckgo.com/?q={encoded_query}&format=json&no_redirect=1"
+        print(f"DuckDuckGo API URL: {url}")  # Added logging
+
+        response = requests.get(url)
+        print(f"DuckDuckGo status code: {response.status_code}")  # Added logging
+
+        data = response.json()
+        print(f"DuckDuckGo response keys: {data.keys()}")  # Added logging
+
+        results = []
+
+        # Try to extract RelatedTopics
+        if 'RelatedTopics' in data and isinstance(data['RelatedTopics'], list):
+            for item in data['RelatedTopics'][:3]:  # Limit to top 3
+                if isinstance(item, dict) and 'Text' in item and 'FirstURL' in item:
+                    results.append({
+                        "title": item['Text'],
+                        "url": item['FirstURL']
+                    })
+                elif isinstance(item, dict) and 'Topics' in item:
+                    # Handle nested topics
+                    for subtopic in item['Topics'][:2]:  # Limit to top 2 subtopics
+                        if 'Text' in subtopic and 'FirstURL' in subtopic:
+                            results.append({
+                                "title": subtopic['Text'],
+                                "url": subtopic['FirstURL']
+                            })
+
+        # If no results from RelatedTopics, try Abstract
+        if not results and 'Abstract' in data and data['Abstract']:
+            results.append({
+                "title": data.get('Heading', 'Abstract'),
+                "url": data.get('AbstractURL', '#'),
+                "text": data['Abstract']
+            })
+
+        print(f"Extracted {len(results)} results from DuckDuckGo")  # Added logging
+        return results
+
+    except Exception as e:
+        print(f"Error in DuckDuckGo search: {str(e)}")
+        traceback.print_exc()
+        return []
+
+@app.route('/web_search_chat', methods=['POST'])
+def web_search_chat():
+    """
+    Web search chatbot endpoint using DuckDuckGo API. Independent of /search or /search_image.
+    """
+    try:
+        data = request.json
+        query = data.get('query')
+
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+
+        # Perform DuckDuckGo web search
+        search_results = perform_duckduckgo_search(query)
+
+        if not search_results:
+           return jsonify({"response": "No relevant web results found."}), 200
+
+        # Format results into a readable string for GPT
+        results_text = "\n".join(
+            [f"- [{r['title']}]({r['url']})" for r in search_results]
+        )
+
+        prompt = f"""
+        A user asked the following question: "{query}"
+
+        Here are some related web results from DuckDuckGo:
+        {results_text}
+
+        Based on these, provide a brief and helpful response or summary for the user.
+        """
+
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that uses real-time search data to respond."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+
+        formatted_response = response.choices[0].message.content.strip()
+        return jsonify({
+            "response": formatted_response,
+            "raw_results": search_results
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 
 
 if __name__ == "__main__":
